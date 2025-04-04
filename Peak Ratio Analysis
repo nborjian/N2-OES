@@ -1,0 +1,271 @@
+import os
+import json
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # for 3D plotting if needed
+from jvframework.misc import hdd_share
+from scipy.signal import find_peaks
+
+
+##############################################################################
+# 1) READ JSON FILES -> BUILD A TABLE OF SHOT PARAMETERS
+##############################################################################
+json_directory = r"H:\Data\tb1\2025-01-31\N2Plasma_31JAN"
+json_directory = hdd_share(json_directory)
+
+
+shots = []
+bp_pressure_data = []
+tf10_power_data = []
+qn11_flow_data = []
+bf21_flow_data = []
+
+
+for filename in sorted(os.listdir(json_directory)):
+    if filename.lower().endswith('.json'):
+        # Example JSON name: "N2Plasma_31JAN_shot21_....json"
+        base_name, _ = os.path.splitext(filename)
+        shot_label = None
+        for part in base_name.split("_"):
+            if part.lower().startswith("shot"):
+                shot_label = part.lower()  # e.g., "shot21"
+                break
+        if shot_label is None:
+            shot_label = "unknown"
+
+
+        # Read JSON
+        with open(os.path.join(json_directory, filename), 'r') as f:
+            data = json.load(f)
+
+
+        tag_data = data.get("tag", {})
+        bp_pressure_data.append(tag_data.get("bp10_pressure", None))
+        tf10_power_data.append(tag_data.get("tf10_power", None))
+        qn11_flow_data.append(tag_data.get("qn11_setpoint", None))
+        bf21_flow_data.append(tag_data.get("bf21_mf", None))
+        shots.append(shot_label)
+
+
+df_shots = pd.DataFrame({
+    "ShotLabel": shots,
+    "BP10 Pressure": bp_pressure_data,
+    "TF10 Power": tf10_power_data,
+    "QN11 Flow": qn11_flow_data,
+    "BF21 Flow": bf21_flow_data
+})
+
+
+df_shots.dropna(inplace=True)  # optional: remove incomplete rows
+
+
+# Convert "shot21" -> integer 21
+def parse_shot_number(shot_str):
+    # e.g. "shot21" -> 21
+    # If we can't parse, return None
+    if shot_str.startswith("shot"):
+        try:
+            return int(shot_str.replace("shot", ""))
+        except ValueError:
+            return None
+    return None
+
+
+df_shots["ShotNum"] = df_shots["ShotLabel"].apply(parse_shot_number)
+
+
+# ******* EXCLUDE all shots where TF10=0 *******
+df_shots = df_shots[df_shots["TF10 Power"] != 0].copy()
+
+
+df_shots.dropna(subset=["ShotNum"], inplace=True)
+
+
+# Build a dict for quick lookup: conditions_dict["shot21"] = (21, BP10, TF10, QN11, BF21)
+conditions_dict = {}
+for idx, row in df_shots.iterrows():
+    shot_lbl = row["ShotLabel"]
+    shot_num = row["ShotNum"]
+    bp10 = row["BP10 Pressure"]
+    tf10 = row["TF10 Power"]
+    qn11 = row["QN11 Flow"]
+    bf21 = row["BF21 Flow"]
+    conditions_dict[shot_lbl] = (shot_num, bp10, tf10, qn11, bf21)
+
+
+##############################################################################
+# 2) READ WAVELENGTH CALIBRATION
+##############################################################################
+wavelength_path = hdd_share(r"H:\Software\OceanInsight\HR2\jvcalibration\wavelengths.csv")
+df_wavelengths = pd.read_csv(wavelength_path)
+calib_columns = df_wavelengths.columns.tolist()
+
+
+##############################################################################
+# 3) SCAN CSV FILES, FIND PEAKS, COMPUTE TOP 10 (MOLECULAR) & TOP 3 (ATOMIC)
+##############################################################################
+csv_directory = r"H:\Data\tb1\2025-01-31\N2Plasma_31JAN"
+csv_directory = hdd_share(csv_directory)
+
+
+results = []
+
+
+for filename in sorted(os.listdir(csv_directory)):
+    if filename.lower().endswith('.csv') and ("hr2" in filename.lower()):
+        # Parse shot label
+        base_name, _ = os.path.splitext(filename)
+        shot_lbl = None
+        for part in base_name.split("_"):
+            if part.lower().startswith("shot"):
+                shot_lbl = part.lower()  # e.g. "shot24"
+                break
+        if shot_lbl is None:
+            continue
+
+
+        # Check if we have JSON data for this shot
+        if shot_lbl not in conditions_dict:
+            # E.g., TF10=0 or unknown shot, skip
+            continue
+
+
+        shot_num, bp10, tf10, qn11, bf21 = conditions_dict[shot_lbl]
+
+
+        # Read spectrum
+        csv_path = os.path.join(csv_directory, filename)
+        csv_path = hdd_share(csv_path)
+        df_spectrum = pd.read_csv(csv_path)
+
+
+        # Rename columns
+        df_spectrum.columns = ["timestamp"] + calib_columns
+        x_values = df_spectrum.columns[1:].astype(float)
+        y_values = df_spectrum.iloc[0, 1:].values
+
+
+        # Find ALL peaks in the entire 200-900 nm range
+        peaks, properties = find_peaks(y_values, prominence=50)
+
+
+        # Filter peaks for 200 <= wl <= 900
+        valid_peak_indices = [p for p in peaks if 200 <= x_values[p] <= 900]
+        peak_list = [(x_values[i], y_values[i]) for i in valid_peak_indices]
+        peak_list.sort(key=lambda x: x[1], reverse=True)
+
+
+        # Separate the peaks into 200-700 nm (Molecular) vs. 700-900 nm (Atomic)
+        molecular_peaks = [(wl, it) for (wl, it) in peak_list if 200 <= wl < 700]
+        atomic_peaks = [(wl, it) for (wl, it) in peak_list if 700 <= wl <= 900]
+
+
+        # Take top 10 from molecular, top 3 from atomic
+        top10_mol = molecular_peaks[:10]
+        top3_atom = atomic_peaks[:3]
+
+
+        avg_mol = np.mean([p[1] for p in top10_mol]) if len(top10_mol) > 0 else 0
+        avg_atom = np.mean([p[1] for p in top3_atom]) if len(top3_atom) > 0 else 0
+
+
+        results.append({
+            "ShotLabel": shot_lbl,
+            "ShotNum": shot_num,
+            "BP10": bp10,
+            "TF10": tf10,
+            "QN11": qn11,
+            "BF21": bf21,
+            "Molecular N2 peaks": top10_mol,
+            "Atomic N peaks": top3_atom,
+            "AvgMol": avg_mol,
+            "AvgAtom": avg_atom
+        })
+
+
+##############################################################################
+# 4) BUILD A DATAFRAME FOR SUMMARY
+##############################################################################
+df_results = pd.DataFrame(results)
+df_results["Ratio"] = df_results["AvgAtom"] / df_results["AvgMol"].replace(0, np.nan)
+df_results.sort_values(by="ShotNum", inplace=True)
+
+
+# A) Print detailed peaks
+print("\n============= Detailed Peaks per Shot (TF10 != 0) =============\n")
+for idx, row in df_results.iterrows():
+    shot_lbl = row["ShotLabel"]
+    shot_num = row["ShotNum"]
+    print(f"Shot: {shot_lbl}  (ShotNum={shot_num})")
+    print(f"  BP10={row['BP10']}, TF10={row['TF10']}, QN11={row['QN11']}, BF21={row['BF21']}")
+    print("  Molecular N2 peaks (200-700 nm):")
+    for (wl, it) in row["Molecular N2 peaks"]:
+        print(f"    Wavelength={wl:.1f} nm, Intensity={it:.1f}")
+    print("  Atomic N peaks (700-900 nm):")
+    for (wl, it) in row["Atomic N peaks"]:
+        print(f"    Wavelength={wl:.1f} nm, Intensity={it:.1f}")
+    print(f"  AvgMol={row['AvgMol']:.1f}, AvgAtom={row['AvgAtom']:.1f}, Ratio={row['Ratio']:.3f}")
+    print("-----------------------------------------------------")
+
+
+# B) Print concise table
+print("\n============= Summary Table of Average Peak Intensities (TF10 != 0) =============\n")
+table_cols = ["ShotLabel", "ShotNum", "BP10", "TF10", "QN11", "BF21", "AvgMol", "AvgAtom", "Ratio"]
+print(df_results[table_cols].to_string(index=False))
+
+
+##############################################################################
+# 5) PLOTS OF AvgAtom & Ratio vs. TF10, BP10, BF21
+##############################################################################
+def plot_scatter(df, xcol, ycol, title, xlabel, ylabel):
+    plt.figure(figsize=(6, 4))
+    plt.scatter(df[xcol], df[ycol], color='b', alpha=0.7)
+    plt.title(title, fontsize=14)
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ycol, fontsize=12)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+# A) Average Atomic N peak intensity vs TF10
+plot_scatter(df_results, "TF10", "AvgAtom",
+             title="Avg Atomic N Peak Intensity vs TF10",
+             xlabel="TF10 Power (W)",
+             ylabel="Avg Atomic N Peak Intensity")
+
+
+# B) Average Atomic N peak intensity vs BP10
+plot_scatter(df_results, "BP10", "AvgAtom",
+             title="Avg Atomic N Peak Intensity vs BP10",
+             xlabel="BP10 Pressure (kPa)",
+             ylabel="Avg Atomic N Peak Intensity")
+
+
+# C) Average Atomic N peak intensity vs BF21
+plot_scatter(df_results, "BF21", "AvgAtom",
+             title="Avg Atomic N Peak Intensity vs BF21",
+             xlabel="BF21 Flow (slpm)",
+             ylabel="Avg Atomic N Peak Intensity")
+
+
+# D) Ratio vs TF10
+plot_scatter(df_results, "TF10", "Ratio",
+             title="(Avg Atomic N Peak Intensity / Avg Molecular N2 Peak Intensity) vs TF10",
+             xlabel="TF10 Power (W)",
+             ylabel="Ratio")
+
+
+# E) Ratio vs BP10
+plot_scatter(df_results, "BP10", "Ratio",
+             title="(Avg Atomic N Peak Intensity / Avg Molecular N2 Peak Intensity) vs BP10",
+             xlabel="BP10 Pressure (kPa)",
+             ylabel="Ratio")
+
+
+# F) Ratio vs BF21
+plot_scatter(df_results, "BF21", "Ratio",
+             title="(Avg Atomic N Peak Intensity / Avg Molecular N2 Peak Intensity) vs BF21",
+             xlabel="BF21 Flow (slpm)",
+             ylabel="Ratio")
